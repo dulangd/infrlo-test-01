@@ -1,6 +1,6 @@
 {
   "name": "infrlo-node",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "private": true,
   "description": "Infrlo HTTP/WebSocket node with health endpoint, country verification and Railway registry integration",
   "main": "index.js",
