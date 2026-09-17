@@ -1,9 +1,7 @@
 'use strict';
 
-// Infrlo does not currently document a public runtime-port contract.
-// Respect an injected PORT when present; otherwise use the common PaaS default 3000.
-if (!String(process.env.PORT || '').trim()) {
-  process.env.PORT = '3000';
-}
+// Infrlo's own public Node.js sample listens on 0.0.0.0:5000.
+// Force the app to the platform's expected internal web port so its router can reach us.
+process.env.PORT = '5000';
 
 require('./index.js');
