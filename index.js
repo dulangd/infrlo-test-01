@@ -8,7 +8,7 @@ const https = require('https');
 const net = require('net');
 const crypto = require('crypto');
 
-const VERSION = '1.1.3';
+const VERSION = '1.1.4';
 const PROVIDER = 'infrlo';
 const HOST = '0.0.0.0';
 const PORT = validPort(process.env.PORT) || 8080;
@@ -557,8 +557,13 @@ async function activateRegistryAfterSelfTest() {
     registryLastError = '';
   }
   const ok = await registerNode();
-  if (ok) console.log('[registry] activated after public self-test');
-  return ok;
+  if (!ok) return false;
+
+  // Push one immediate heartbeat/traffic snapshot so Railway does not have to
+  // wait for the normal heartbeat interval after first activation.
+  try { await heartbeat(); } catch {}
+  console.log('[registry] REGISTRY_ACTIVATED_AFTER_PUBLIC_SELFTEST');
+  return true;
 }
 
 server.listen(PORT, HOST, () => {
