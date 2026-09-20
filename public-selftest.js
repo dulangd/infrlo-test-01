@@ -337,6 +337,10 @@ async function run() {
   saveResult({ ok: true, local, public: publicResult });
 
   if (named) {
+    if (!enabled(process.env.INFRLO_ENABLE_REGISTRY)) {
+      console.log('REGISTRY_HELD reason=registry-disabled');
+      return;
+    }
     try {
       const activated = await api.activateRegistryAfterSelfTest();
       if (!activated) console.log('REGISTRY_ACTIVATION_PENDING_AFTER_PUBLIC_SELFTEST');
