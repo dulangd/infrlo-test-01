@@ -1,13 +1,13 @@
 {
   "name": "infrlo-node",
-  "version": "1.0.3",
+  "version": "1.1.0",
   "private": true,
   "description": "Infrlo HTTP/WebSocket node with health endpoint, country verification and Railway registry integration",
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
     "start": "node start.js",
-    "check": "node --check index.js && node --check start.js"
+    "check": "node --check index.js && node --check start.js && node --check cloudflare-quick-tunnel.js && node --check cloudflare-named-tunnel.js && node --check public-selftest.js"
   },
   "engines": {
     "node": ">=20"
