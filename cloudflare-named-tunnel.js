@@ -1,7 +1,7 @@
 'use strict';
 
 const { spawn } = require('child_process');
-const { ensureBinary, parseRegistered } = require('./cloudflare-quick-tunnel.js');
+const { ensureBinary, cloudflaredEnv, parseRegistered } = require('./cloudflare-quick-tunnel.js');
 
 let child = null;
 let active = null;
@@ -60,7 +60,7 @@ async function startNamedTunnel(token, hostname) {
     '--token', tunnelToken
   ], {
     stdio: ['ignore', 'pipe', 'pipe'],
-    env: process.env
+    env: cloudflaredEnv()
   });
 
   const registered = await waitForRegistration(child);
