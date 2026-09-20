@@ -19,8 +19,26 @@ function binaryPath() {
 }
 
 function extractQuickTunnelUrl(text) {
-  const match = String(text || '').match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com\b/i);
-  return match ? match[0] : '';
+  const matches = String(text || '').match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com\b/ig) || [];
+  for (const value of matches) {
+    try {
+      const host = new URL(value).hostname.toLowerCase();
+      if (host === 'api.trycloudflare.com') continue;
+      if (!host.endsWith('.trycloudflare.com')) continue;
+      return value;
+    } catch {}
+  }
+  return '';
+}
+
+function sanitizeDiagnostic(text) {
+  return String(text || '')
+    .replace(/(--token\s+)[^\s]+/ig, '$1[REDACTED]')
+    .replace(/(token[=:]\s*)[^\s]+/ig, '$1[REDACTED]')
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 420);
 }
 
 function parseRegistered(text) {
@@ -74,6 +92,7 @@ function waitForReady(proc, timeoutMs = 30000) {
     let url = '';
     let registered = null;
     let lastIssue = '';
+    let lastDiagnostic = '';
 
     const finish = (err, value) => {
       if (settled) return;
@@ -109,6 +128,18 @@ function waitForReady(proc, timeoutMs = 30000) {
       if (/7844/.test(text) && /(fail|timeout|blocked|unreachable|refused)/i.test(text)) lastIssue = 'port-7844';
       else if (/failed to dial|connection timeout|connect timeout/i.test(text)) lastIssue = 'edge-dial';
       else if (/DNS/i.test(text) && /(fail|unresolv|error)/i.test(text)) lastIssue = 'edge-dns';
+      else if (/failed to request quick tunnel|quick tunnel.*(fail|error)|trycloudflare.*(fail|error)|status code/i.test(text)) lastIssue = 'quick-tunnel-api';
+
+      for (const line of text.split(/\r?\n/)) {
+        if (!line.trim()) continue;
+        if (/\b(ERR|WRN)\b|error=|failed|failure|forbidden|unauthorized|rate.?limit|timeout|refused/i.test(line)) {
+          const diag = sanitizeDiagnostic(line);
+          if (diag && diag !== lastDiagnostic) {
+            lastDiagnostic = diag;
+            console.log(`CF_TUNNEL_DIAG ${diag}`);
+          }
+        }
+      }
 
       maybeReady();
     };
