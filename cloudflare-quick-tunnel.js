@@ -3,6 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
+const tls = require('tls');
 
 let child = null;
 let active = null;
@@ -13,9 +14,36 @@ function assetName(arch = process.arch) {
   return '';
 }
 
-function binaryPath() {
+function stateDir() {
   const home = process.env.HOME || '/tmp';
-  return path.join(home, '.infrlo-node', 'bin', 'cloudflared');
+  return path.join(home, '.infrlo-node');
+}
+
+function binaryPath() {
+  return path.join(stateDir(), 'bin', 'cloudflared');
+}
+
+function caBundlePath() {
+  return path.join(stateDir(), 'ca-bundle.pem');
+}
+
+function ensureCaBundle() {
+  const file = caBundlePath();
+  const roots = Array.isArray(tls.rootCertificates) ? tls.rootCertificates.filter(Boolean) : [];
+  if (!roots.length) throw new Error('node_root_ca_empty');
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const body = roots.join('\n') + '\n';
+  fs.writeFileSync(file, body, { mode: 0o600 });
+  console.log(`CF_CA_BUNDLE_READY certificates=${roots.length}`);
+  return file;
+}
+
+function cloudflaredEnv() {
+  const caFile = ensureCaBundle();
+  return {
+    ...process.env,
+    SSL_CERT_FILE: caFile
+  };
 }
 
 function extractQuickTunnelUrl(text) {
@@ -171,7 +199,7 @@ async function startQuickTunnel(localPort) {
     '--url', `http://127.0.0.1:${port}`
   ], {
     stdio: ['ignore', 'pipe', 'pipe'],
-    env: process.env
+    env: cloudflaredEnv()
   });
 
   const ready = await waitForReady(child);
@@ -205,4 +233,4 @@ function stopQuickTunnel() {
   }
 }
 
-module.exports = { ensureBinary, parseRegistered, startQuickTunnel, stopQuickTunnel };
+module.exports = { ensureBinary, ensureCaBundle, cloudflaredEnv, parseRegistered, startQuickTunnel, stopQuickTunnel };
