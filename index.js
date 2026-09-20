@@ -8,7 +8,7 @@ const https = require('https');
 const net = require('net');
 const crypto = require('crypto');
 
-const VERSION = '1.0.3';
+const VERSION = '1.1.0';
 const PROVIDER = 'infrlo';
 const HOST = '0.0.0.0';
 const PORT = validPort(process.env.PORT) || 8080;
@@ -21,6 +21,8 @@ const REGISTRY_PROOF_FILE = path.join(STATE_DIR, 'registry-proof.txt');
 const REGISTRY_URL = clean(process.env.REGISTRY_URL || 'https://subscription-server-v2-production.up.railway.app').replace(/\/+$/, '');
 const REGISTRY_TOKEN = clean(process.env.REGISTRY_TOKEN);
 const HEARTBEAT_MS = Math.max(60_000, Number(process.env.HEARTBEAT_MS || 600000));
+const REGISTRY_REQUIRE_PUBLIC_SELFTEST = /^(1|true|yes|on)$/i.test(String(process.env.REGISTRY_REQUIRE_PUBLIC_SELFTEST || '0'));
+const TUNNEL_MODE = /^(1|true|yes|on)$/i.test(String(process.env.INFRLO_CF_QUICK_TUNNEL || '0')) || !!(clean(process.env.CF_TUNNEL_TOKEN) && clean(process.env.CF_TUNNEL_HOSTNAME));
 const ENDPOINT_OVERRIDE = clean(process.env.PUBLIC_ENDPOINT);
 
 function clean(v) { return String(v || '').trim(); }
@@ -187,13 +189,21 @@ function endpointScore(ep) {
   if (!net.isIP(ep.host)) score += 40;
   if (ep.port === 443) score += 20;
   if (ep.source === 'override') score += 200;
+  if (String(ep.source || '').includes('selftest') || String(ep.source || '').includes('cloudflare')) score += 180;
   return score;
 }
-function loadEndpoint() { return parseEndpointString(ENDPOINT_OVERRIDE) || safeJsonRead(ENDPOINT_FILE); }
+function loadEndpoint() {
+  const override = parseEndpointString(ENDPOINT_OVERRIDE);
+  if (override) return override;
+  if (TUNNEL_MODE) return null;
+  return safeJsonRead(ENDPOINT_FILE);
+}
 
 let publicEndpoint = loadEndpoint();
 let registerTimer = null;
 let registered = false;
+let registryActivated = !REGISTRY_REQUIRE_PUBLIC_SELFTEST;
+let registryWaitLogged = false;
 let registryLastStatus = null;
 let registryLastError = '';
 let registryLastAttemptAt = null;
@@ -232,6 +242,29 @@ function learnEndpoint(req) {
   }
 }
 function currentEndpoint(req) { if (req) learnEndpoint(req); return publicEndpoint?.host ? publicEndpoint : null; }
+
+function setPublicEndpoint(endpoint, source = 'runtime') {
+  const host = clean(endpoint?.host).toLowerCase();
+  const tlsEnabled = !!endpoint?.tls;
+  const port = validPort(endpoint?.port) || (tlsEnabled ? 443 : 80);
+  if (!host || host === 'localhost' || host === '127.0.0.1' || host === '::1') return false;
+
+  const candidate = {
+    protocol: tlsEnabled ? 'https' : 'http',
+    host,
+    port,
+    source,
+    mode: clean(endpoint?.mode) || 'runtime',
+    learnedAt: new Date().toISOString()
+  };
+
+  publicEndpoint = candidate;
+  atomicJsonWrite(ENDPOINT_FILE, candidate);
+  process.env.PUBLIC_ENDPOINT = `${candidate.protocol}://${candidate.host}:${candidate.port}`;
+  console.log(`[endpoint] ready source=${source} mode=${candidate.mode} ${candidate.protocol}://${candidate.host}:${candidate.port}`);
+  return true;
+}
+
 function formatHost(host) { return net.isIP(host) === 6 ? `[${host}]` : host; }
 function baseUrl(ep) {
   const defaultPort = (ep.protocol === 'https' && ep.port === 443) || (ep.protocol === 'http' && ep.port === 80);
@@ -280,7 +313,7 @@ const requestHandler = (req, res) => {
       geo: { country: countryState.code, verified: countryState.verified, mismatch: countryState.mismatch, egress_ip: countryState.egressIp, checked_at: countryState.checkedAt },
       traffic: { connections, upload_bytes: bytesUp, download_bytes: bytesDown },
       registry_proof_sha256: registryProofSha256,
-      registry: { configured: true, auth_mode: REGISTRY_TOKEN ? 'bearer-token' : 'public-proof', url: REGISTRY_URL, registered, last_status: registryLastStatus, last_error: registryLastError || null, last_attempt_at: registryLastAttemptAt, last_success_at: registryLastSuccessAt }
+      registry: { configured: true, auth_mode: REGISTRY_TOKEN ? 'bearer-token' : 'public-proof', url: REGISTRY_URL, require_public_selftest: REGISTRY_REQUIRE_PUBLIC_SELFTEST, activated: registryActivated, registered, last_status: registryLastStatus, last_error: registryLastError || null, last_attempt_at: registryLastAttemptAt, last_success_at: registryLastSuccessAt }
     };
     return send(res, 200, bodyless ? '' : JSON.stringify(payload), 'application/json; charset=utf-8');
   }
@@ -458,6 +491,14 @@ function requestJson(urlString, method, body, token = '', timeout = 10_000) {
   });
 }
 function scheduleRegistration(delay = 0) {
+  if (!registryActivated) {
+    registryLastError = 'waiting for public self-test';
+    if (!registryWaitLogged) {
+      registryWaitLogged = true;
+      console.log('[registry] waiting for public self-test');
+    }
+    return;
+  }
   if (!publicEndpoint?.host) { registryLastError = 'public endpoint not ready'; return; }
   clearTimeout(registerTimer);
   registerTimer = setTimeout(() => registerNode().catch(e => {
@@ -466,6 +507,7 @@ function scheduleRegistration(delay = 0) {
   }), delay);
 }
 async function registerNode() {
+  if (!registryActivated) return false;
   if (!publicEndpoint?.host) return false;
   await verifyCountry();
   registryLastAttemptAt = new Date().toISOString();
@@ -488,7 +530,7 @@ async function registerNode() {
   return true;
 }
 async function heartbeat() {
-  if (!publicEndpoint?.host) return;
+  if (!registryActivated || !publicEndpoint?.host) return;
   if (!countryState.verified) { try { await verifyCountry(true); } catch {} }
   if (!REGISTRY_TOKEN) {
     try { await registerNode(); } catch (e) { registered = false; registryLastError = e.message; }
@@ -507,13 +549,29 @@ async function heartbeat() {
   }
 }
 
+async function activateRegistryAfterSelfTest() {
+  if (!publicEndpoint?.host) throw new Error('public_endpoint_not_ready');
+  if (!registryActivated) {
+    registryActivated = true;
+    registryWaitLogged = false;
+    registryLastError = '';
+  }
+  const ok = await registerNode();
+  if (ok) console.log('[registry] activated after public self-test');
+  return ok;
+}
+
 server.listen(PORT, HOST, () => {
   console.log(`[ready] infrlo-node v${VERSION} ${HOST}:${PORT} http/ws`);
   console.log(`[ready] provider=${PROVIDER} node_id=${identity.nodeId}`);
   console.log(`[registry] mode=${REGISTRY_TOKEN ? 'bearer-token' : 'public-proof'} url=${REGISTRY_URL}`);
   console.log('[security] credentials, UUID, WS path, subscription token and VLESS URI are not printed');
+  if (REGISTRY_REQUIRE_PUBLIC_SELFTEST) console.log('[registry] REGISTRY_WAITING_PUBLIC_SELFTEST');
   if (publicEndpoint?.host) scheduleRegistration(1000);
-  else console.log('[ready] waiting for first public request to learn the HTTPS endpoint');
+  else console.log('[ready] waiting for a proven public endpoint');
   verifyCountry().catch(e => console.warn('[geo] initial verification failed:', e.message));
   setInterval(heartbeat, HEARTBEAT_MS).unref();
 });
+
+
+module.exports = { identity, server, setPublicEndpoint, activateRegistryAfterSelfTest };
