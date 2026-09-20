@@ -97,7 +97,7 @@ async function ensureBinary() {
   try {
     const res = await fetch(url, {
       redirect: 'follow',
-      headers: { 'user-agent': 'infrlo-node/1.1.0' },
+      headers: { 'user-agent': 'infrlo-node/1.1.2' },
       signal: ctl.signal
     });
     if (!res.ok) throw new Error(`download_http_${res.status}`);
