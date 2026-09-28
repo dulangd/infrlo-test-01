@@ -6,7 +6,7 @@
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
-    "start": "node start.js",
+    "start": "npm run check && node start.js",
     "check": "node --check index.js && node --check start.js && node --check cloudflare-quick-tunnel.js && node --check cloudflare-named-tunnel.js && node --check public-selftest.js"
   },
   "engines": {
