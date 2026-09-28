@@ -300,71 +300,73 @@ async function run() {
   }
 
   const nativeHost = String(process.env.INFRLO_NATIVE_HOST || 'qqnioc.infrlo.com').trim().toLowerCase();
-  let nativeResult = { ok: false, stage: 'not-run', host: nativeHost, port: 443, tls: true };
-
-  if (nativeHost) {
-    nativeResult = await testPublicEndpoint('native', nativeHost, identity, 3);
-    api.setIngressSelfTest('native', nativeResult);
-    if (nativeResult.ok) {
-      api.setIngressEndpoint('native', {
-        host: nativeHost,
-        port: 443,
-        tls: true,
-        mode: 'infrlo-native'
-      }, 'native-selftest');
-      console.log(`NATIVE_WS_SELFTEST_READY target=${nativeResult.target} endpoint=${nativeHost}:443 tls=on mode=infrlo-native`);
-      const nativeSub = api.getSubscriptionUrl('native', true);
-      if (nativeSub) console.log(`SUB_NATIVE_READY ${nativeSub}`);
-    } else {
-      console.log(`NATIVE_WS_SELFTEST_FAILED ${resultDetail(nativeResult)} endpoint=${nativeHost}:443`);
-    }
-  } else {
-    api.setIngressSelfTest('native', { ok: false, stage: 'configuration' });
-    console.log('NATIVE_WS_SELFTEST_SKIPPED reason=native-host-missing');
-  }
-
   const token = String(process.env.CF_TUNNEL_TOKEN || '').trim();
   const configuredCfHost = String(process.env.CF_TUNNEL_HOSTNAME || '').trim().toLowerCase();
   const named = !!(token && configuredCfHost);
   const quick = enabled(process.env.INFRLO_CF_QUICK_TUNNEL);
 
-  let cloudflareResult = { ok: false, stage: 'not-run', host: configuredCfHost, port: 443, tls: true };
   let cloudflareHost = configuredCfHost;
   let cloudflareMode = named ? 'cloudflare-named-tunnel' : (quick ? 'cloudflare-quick-tunnel' : 'cloudflare-disabled');
+  let tunnelStartError = null;
 
+  // Start the Cloudflare connector first so a slow/broken native ingress never
+  // delays the primary fallback path.
   if (named || quick) {
-    let tunnel = null;
     try {
-      if (named) {
-        tunnel = await require('./cloudflare-named-tunnel.js').startNamedTunnel(token, configuredCfHost);
-      } else {
-        tunnel = await require('./cloudflare-quick-tunnel.js').startQuickTunnel(Number(process.env.PORT || 5000));
-      }
+      const tunnel = named
+        ? await require('./cloudflare-named-tunnel.js').startNamedTunnel(token, configuredCfHost)
+        : await require('./cloudflare-quick-tunnel.js').startQuickTunnel(Number(process.env.PORT || 5000));
       cloudflareHost = tunnel.host;
-      cloudflareResult = await testPublicEndpoint('cloudflare', cloudflareHost, identity, 3);
     } catch (e) {
       const code = String(e?.message || e || 'ERR').replace(/\s+/g, '_').slice(0, 100);
-      cloudflareResult = { ok: false, stage: 'tunnel-start', code, host: cloudflareHost, port: 443, tls: true };
+      tunnelStartError = { ok: false, stage: 'tunnel-start', code, host: cloudflareHost, port: 443, tls: true };
       console.log(`CF_TUNNEL_FAILED mode=${named ? 'named' : 'quick'} code=${code}`);
     }
+  }
 
-    api.setIngressSelfTest('cloudflare', cloudflareResult);
+  const nativePromise = nativeHost
+    ? testPublicEndpoint('native', nativeHost, identity, 3)
+    : Promise.resolve({ ok: false, stage: 'configuration', label: 'native', host: '' });
 
-    if (cloudflareResult.ok) {
-      api.setIngressEndpoint('cloudflare', {
-        host: cloudflareHost,
-        port: 443,
-        tls: true,
-        mode: cloudflareMode
-      }, 'cloudflare-selftest');
-      console.log(`CF_WS_SELFTEST_READY target=${cloudflareResult.target} endpoint=${cloudflareHost}:443 tls=on mode=${cloudflareMode}`);
-      const cfSub = api.getSubscriptionUrl('cloudflare', true);
-      if (cfSub) console.log(`SUB_CF_READY ${cfSub}`);
-    } else {
-      console.log(`CF_WS_SELFTEST_FAILED ${resultDetail(cloudflareResult)} endpoint=${cloudflareHost || 'missing'}:443 mode=${cloudflareMode}`);
-    }
+  const cloudflarePromise = tunnelStartError
+    ? Promise.resolve(tunnelStartError)
+    : ((named || quick) && cloudflareHost
+        ? testPublicEndpoint('cloudflare', cloudflareHost, identity, 3)
+        : Promise.resolve({ ok: false, stage: 'configuration', label: 'cloudflare', host: cloudflareHost }));
+
+  const [nativeResult, cloudflareResult] = await Promise.all([nativePromise, cloudflarePromise]);
+
+  api.setIngressSelfTest('native', nativeResult);
+  if (nativeResult.ok) {
+    api.setIngressEndpoint('native', {
+      host: nativeHost,
+      port: 443,
+      tls: true,
+      mode: 'infrlo-native'
+    }, 'native-selftest');
+    console.log(`NATIVE_WS_SELFTEST_READY target=${nativeResult.target} endpoint=${nativeHost}:443 tls=on mode=infrlo-native`);
+    const nativeSub = api.getSubscriptionUrl('native', true);
+    if (nativeSub) console.log(`SUB_NATIVE_READY ${nativeSub}`);
+  } else if (nativeHost) {
+    console.log(`NATIVE_WS_SELFTEST_FAILED ${resultDetail(nativeResult)} endpoint=${nativeHost}:443`);
   } else {
-    api.setIngressSelfTest('cloudflare', { ok: false, stage: 'configuration' });
+    console.log('NATIVE_WS_SELFTEST_SKIPPED reason=native-host-missing');
+  }
+
+  api.setIngressSelfTest('cloudflare', cloudflareResult);
+  if (cloudflareResult.ok) {
+    api.setIngressEndpoint('cloudflare', {
+      host: cloudflareHost,
+      port: 443,
+      tls: true,
+      mode: cloudflareMode
+    }, 'cloudflare-selftest');
+    console.log(`CF_WS_SELFTEST_READY target=${cloudflareResult.target} endpoint=${cloudflareHost}:443 tls=on mode=${cloudflareMode}`);
+    const cfSub = api.getSubscriptionUrl('cloudflare', true);
+    if (cfSub) console.log(`SUB_CF_READY ${cfSub}`);
+  } else if (named || quick) {
+    console.log(`CF_WS_SELFTEST_FAILED ${resultDetail(cloudflareResult)} endpoint=${cloudflareHost || 'missing'}:443 mode=${cloudflareMode}`);
+  } else {
     console.log('CF_WS_SELFTEST_SKIPPED reason=cloudflare-tunnel-not-configured');
   }
 
@@ -380,11 +382,20 @@ async function run() {
     console.log(`DUAL_INGRESS_FAILED logical_nodes=1 node_id=${identity.nodeId}`);
   }
 
-  // Registry stays one logical node. Prefer Cloudflare as the single registry
-  // endpoint; fall back to native only if Cloudflare is unavailable.
+  // Registry remains exactly one logical node. Prefer the configured primary
+  // ingress (Cloudflare by default), then fall back to the other healthy path.
+  const configuredPrimary = String(process.env.INFRLO_PRIMARY_INGRESS || 'cloudflare').trim().toLowerCase() === 'native'
+    ? 'native'
+    : 'cloudflare';
   let primaryKind = '';
-  if (cloudflareReady) primaryKind = 'cloudflare';
-  else if (nativeReady) primaryKind = 'native';
+
+  if (configuredPrimary === 'cloudflare') {
+    if (cloudflareReady) primaryKind = 'cloudflare';
+    else if (nativeReady) primaryKind = 'native';
+  } else {
+    if (nativeReady) primaryKind = 'native';
+    else if (cloudflareReady) primaryKind = 'cloudflare';
+  }
 
   if (primaryKind) api.setPrimaryIngress(primaryKind);
 
