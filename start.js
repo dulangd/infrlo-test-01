@@ -23,6 +23,7 @@ const namedTunnel = !!(
   cfHost
 );
 const quickTunnel = enabled(process.env.INFRLO_CF_QUICK_TUNNEL);
+const primaryIngress = String(process.env.INFRLO_PRIMARY_INGRESS || 'cloudflare').trim().toLowerCase() === 'native' ? 'native' : 'cloudflare';
 
 process.env.REGISTRY_REQUIRE_PUBLIC_SELFTEST = '1';
 
@@ -30,7 +31,7 @@ console.log(
   '[boot] dual-ingress logical_nodes=1' +
   ' native=' + (nativeHost || 'disabled') +
   ' cloudflare=' + (cfHost || (quickTunnel ? 'quick-tunnel' : 'disabled')) +
-  ' primary=cloudflare'
+  ' primary=' + primaryIngress
 );
 
 require('./index.js');
