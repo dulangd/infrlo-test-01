@@ -268,6 +268,8 @@ function learnEndpoint(req) {
     const changed = !previous || previous.protocol !== candidate.protocol || previous.host !== candidate.host || previous.port !== candidate.port;
     ingressEndpoints[kind] = {
       ...candidate,
+      protocol: 'https',
+      port: 443,
       mode: kind === 'native' ? 'infrlo-native' : 'cloudflare-named-tunnel'
     };
     if (changed) console.log(`[endpoint:${kind}] learned ${candidate.protocol}://${candidate.host}:${candidate.port}`);
