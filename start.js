@@ -12,19 +12,29 @@ if (!rawPort) {
   console.log('[boot] using platform PORT=' + rawPort);
 }
 
+if (!String(process.env.INFRLO_NATIVE_HOST || '').trim()) {
+  process.env.INFRLO_NATIVE_HOST = 'qqnioc.infrlo.com';
+}
+
+const nativeHost = String(process.env.INFRLO_NATIVE_HOST || '').trim().toLowerCase();
+const cfHost = String(process.env.CF_TUNNEL_HOSTNAME || '').trim().toLowerCase();
 const namedTunnel = !!(
   String(process.env.CF_TUNNEL_TOKEN || '').trim() &&
-  String(process.env.CF_TUNNEL_HOSTNAME || '').trim()
+  cfHost
 );
 const quickTunnel = enabled(process.env.INFRLO_CF_QUICK_TUNNEL);
 
-if (namedTunnel || quickTunnel) {
-  process.env.REGISTRY_REQUIRE_PUBLIC_SELFTEST = '1';
-  console.log('[boot] Cloudflare tunnel mode=' + (namedTunnel ? 'named' : 'quick') + '; Railway registration gated');
-}
+process.env.REGISTRY_REQUIRE_PUBLIC_SELFTEST = '1';
+
+console.log(
+  '[boot] dual-ingress logical_nodes=1' +
+  ' native=' + (nativeHost || 'disabled') +
+  ' cloudflare=' + (cfHost || (quickTunnel ? 'quick-tunnel' : 'disabled')) +
+  ' primary=cloudflare'
+);
 
 require('./index.js');
 
-if (namedTunnel || quickTunnel) {
-  require('./public-selftest.js');
-}
+// v1.2.0 always self-tests the native ingress. Cloudflare is tested too when
+// Named/Quick Tunnel is configured.
+require('./public-selftest.js');
