@@ -8,7 +8,7 @@ const https = require('https');
 const net = require('net');
 const crypto = require('crypto');
 
-const VERSION = '1.1.4';
+const VERSION = '1.2.0';
 const PROVIDER = 'infrlo';
 const HOST = '0.0.0.0';
 const PORT = validPort(process.env.PORT) || 8080;
@@ -24,6 +24,9 @@ const HEARTBEAT_MS = Math.max(60_000, Number(process.env.HEARTBEAT_MS || 600000)
 const REGISTRY_REQUIRE_PUBLIC_SELFTEST = /^(1|true|yes|on)$/i.test(String(process.env.REGISTRY_REQUIRE_PUBLIC_SELFTEST || '0'));
 const TUNNEL_MODE = /^(1|true|yes|on)$/i.test(String(process.env.INFRLO_CF_QUICK_TUNNEL || '0')) || !!(clean(process.env.CF_TUNNEL_TOKEN) && clean(process.env.CF_TUNNEL_HOSTNAME));
 const ENDPOINT_OVERRIDE = clean(process.env.PUBLIC_ENDPOINT);
+const INFRLO_NATIVE_HOST = clean(process.env.INFRLO_NATIVE_HOST || 'qqnioc.infrlo.com').toLowerCase();
+const CF_PUBLIC_HOST = clean(process.env.CF_TUNNEL_HOSTNAME).toLowerCase();
+const PRIMARY_INGRESS = clean(process.env.INFRLO_PRIMARY_INGRESS || 'cloudflare').toLowerCase() === 'native' ? 'native' : 'cloudflare';
 
 function clean(v) { return String(v || '').trim(); }
 function validPort(v) {
@@ -179,27 +182,41 @@ function parseEndpointString(value) {
     const protocol = u.protocol === 'http:' ? 'http' : 'https';
     const port = validPort(u.port) || (protocol === 'https' ? 443 : 80);
     if (!u.hostname) return null;
-    return { protocol, host: u.hostname, port, source: 'override', learnedAt: new Date().toISOString() };
+    return { protocol, host: u.hostname.toLowerCase(), port, source: 'override', learnedAt: new Date().toISOString() };
   } catch { return null; }
 }
-function endpointScore(ep) {
-  if (!ep?.host) return -1;
-  let score = 0;
-  if (ep.protocol === 'https') score += 100;
-  if (!net.isIP(ep.host)) score += 40;
-  if (ep.port === 443) score += 20;
-  if (ep.source === 'override') score += 200;
-  if (String(ep.source || '').includes('selftest') || String(ep.source || '').includes('cloudflare')) score += 180;
-  return score;
+
+function configuredEndpoint(host, mode) {
+  const h = clean(host).toLowerCase();
+  if (!h) return null;
+  return {
+    protocol: 'https',
+    host: h,
+    port: 443,
+    source: 'config',
+    mode,
+    learnedAt: new Date().toISOString()
+  };
 }
+
 function loadEndpoint() {
   const override = parseEndpointString(ENDPOINT_OVERRIDE);
   if (override) return override;
   if (TUNNEL_MODE) return null;
-  return safeJsonRead(ENDPOINT_FILE);
+  const saved = safeJsonRead(ENDPOINT_FILE);
+  return saved?.host ? saved : null;
 }
 
 let publicEndpoint = loadEndpoint();
+const ingressEndpoints = {
+  native: configuredEndpoint(INFRLO_NATIVE_HOST, 'infrlo-native'),
+  cloudflare: configuredEndpoint(CF_PUBLIC_HOST, 'cloudflare-named-tunnel')
+};
+const ingressSelfTests = {
+  native: { status: 'pending', checked_at: null, detail: null },
+  cloudflare: { status: 'pending', checked_at: null, detail: null }
+};
+
 let registerTimer = null;
 let registered = false;
 let registryActivated = !REGISTRY_REQUIRE_PUBLIC_SELFTEST;
@@ -212,57 +229,141 @@ let bytesUp = 0;
 let bytesDown = 0;
 let connections = 0;
 
-function learnEndpoint(req) {
-  if (ENDPOINT_OVERRIDE) return;
-  const xfProto = clean(String(req.headers['x-forwarded-proto'] || '').split(',')[0]).toLowerCase();
-  const xfHost = clean(String(req.headers['x-forwarded-host'] || '').split(',')[0]);
-  const rawHost = xfHost || clean(req.headers.host);
-  if (!rawHost) return;
-  let hostUrl;
-  try { hostUrl = new URL('http://' + rawHost); } catch { return; }
-  const host = hostUrl.hostname;
-  if (!host || host === 'localhost' || host === '127.0.0.1' || host === '::1') return;
+function requestEndpoint(req) {
+  const xfProto = clean(String(req?.headers?.['x-forwarded-proto'] || '').split(',')[0]).toLowerCase();
+  const xfHost = clean(String(req?.headers?.['x-forwarded-host'] || '').split(',')[0]);
+  const rawHost = xfHost || clean(req?.headers?.host);
+  if (!rawHost) return null;
 
-  const xfPort = validPort(String(req.headers['x-forwarded-port'] || '').split(',')[0]);
-  let protocol = req.socket.encrypted ? 'https' : 'http';
+  let hostUrl;
+  try { hostUrl = new URL('http://' + rawHost); } catch { return null; }
+  const host = clean(hostUrl.hostname).toLowerCase();
+  if (!host || host === 'localhost' || host === '127.0.0.1' || host === '::1') return null;
+
+  const xfPort = validPort(String(req?.headers?.['x-forwarded-port'] || '').split(',')[0]);
+  let protocol = req?.socket?.encrypted ? 'https' : 'http';
   if (xfProto === 'https') protocol = 'https';
   else if (xfProto === 'http') protocol = 'http';
   else if (xfPort === 443) protocol = 'https';
-  const port = xfPort || validPort(hostUrl.port) || (protocol === 'https' ? 443 : 80);
-  const candidate = { protocol, host, port, source: 'request', learnedAt: new Date().toISOString() };
 
-  if (!publicEndpoint || endpointScore(candidate) >= endpointScore(publicEndpoint)) {
-    const changed = !publicEndpoint || candidate.protocol !== publicEndpoint.protocol || candidate.host !== publicEndpoint.host || candidate.port !== publicEndpoint.port;
+  const port = xfPort || validPort(hostUrl.port) || (protocol === 'https' ? 443 : 80);
+  return { protocol, host, port, source: 'request', learnedAt: new Date().toISOString() };
+}
+
+function ingressKindForHost(host) {
+  const h = clean(host).toLowerCase();
+  if (h && ingressEndpoints.native?.host === h) return 'native';
+  if (h && ingressEndpoints.cloudflare?.host === h) return 'cloudflare';
+  return '';
+}
+
+function learnEndpoint(req) {
+  if (ENDPOINT_OVERRIDE) return;
+  const candidate = requestEndpoint(req);
+  if (!candidate) return;
+
+  const kind = ingressKindForHost(candidate.host);
+  if (kind) {
+    const previous = ingressEndpoints[kind];
+    const changed = !previous || previous.protocol !== candidate.protocol || previous.host !== candidate.host || previous.port !== candidate.port;
+    ingressEndpoints[kind] = {
+      ...candidate,
+      mode: kind === 'native' ? 'infrlo-native' : 'cloudflare-named-tunnel'
+    };
+    if (changed) console.log(`[endpoint:${kind}] learned ${candidate.protocol}://${candidate.host}:${candidate.port}`);
+    return;
+  }
+
+  // Compatibility fallback for an explicitly different public endpoint.
+  if (!INFRLO_NATIVE_HOST && !CF_PUBLIC_HOST) {
     publicEndpoint = candidate;
     atomicJsonWrite(ENDPOINT_FILE, candidate);
-    if (changed) {
-      console.log(`[endpoint] learned ${candidate.protocol}://${candidate.host}:${candidate.port}`);
-      scheduleRegistration(800);
-    }
+    scheduleRegistration(800);
   }
 }
-function currentEndpoint(req) { if (req) learnEndpoint(req); return publicEndpoint?.host ? publicEndpoint : null; }
 
-function setPublicEndpoint(endpoint, source = 'runtime') {
+function currentEndpoint(req) {
+  if (req) {
+    learnEndpoint(req);
+    const candidate = requestEndpoint(req);
+    const kind = ingressKindForHost(candidate?.host);
+    if (kind && ingressEndpoints[kind]?.host) return ingressEndpoints[kind];
+  }
+  if (publicEndpoint?.host) return publicEndpoint;
+  return ingressEndpoints.cloudflare || ingressEndpoints.native || null;
+}
+
+function normalizeRuntimeEndpoint(endpoint, source, mode) {
   const host = clean(endpoint?.host).toLowerCase();
-  const tlsEnabled = !!endpoint?.tls;
-  const port = validPort(endpoint?.port) || (tlsEnabled ? 443 : 80);
-  if (!host || host === 'localhost' || host === '127.0.0.1' || host === '::1') return false;
-
-  const candidate = {
-    protocol: tlsEnabled ? 'https' : 'http',
+  const tlsEnabled = endpoint?.tls !== false;
+  const protocol = endpoint?.protocol === 'http' && !tlsEnabled ? 'http' : 'https';
+  const port = validPort(endpoint?.port) || (protocol === 'https' ? 443 : 80);
+  if (!host || host === 'localhost' || host === '127.0.0.1' || host === '::1') return null;
+  return {
+    protocol,
     host,
     port,
     source,
-    mode: clean(endpoint?.mode) || 'runtime',
+    mode: clean(endpoint?.mode || mode) || mode,
     learnedAt: new Date().toISOString()
   };
+}
 
-  publicEndpoint = candidate;
-  atomicJsonWrite(ENDPOINT_FILE, candidate);
-  process.env.PUBLIC_ENDPOINT = `${candidate.protocol}://${candidate.host}:${candidate.port}`;
-  console.log(`[endpoint] ready source=${source} mode=${candidate.mode} ${candidate.protocol}://${candidate.host}:${candidate.port}`);
+function setIngressEndpoint(kind, endpoint, source = 'runtime') {
+  if (kind !== 'native' && kind !== 'cloudflare') return false;
+  const mode = kind === 'native' ? 'infrlo-native' : 'cloudflare-named-tunnel';
+  const candidate = normalizeRuntimeEndpoint(endpoint, source, mode);
+  if (!candidate) return false;
+  ingressEndpoints[kind] = candidate;
+  console.log(`[endpoint:${kind}] ready source=${source} mode=${candidate.mode} ${candidate.protocol}://${candidate.host}:${candidate.port}`);
   return true;
+}
+
+function setIngressSelfTest(kind, result) {
+  if (kind !== 'native' && kind !== 'cloudflare') return false;
+  ingressSelfTests[kind] = {
+    status: result?.ok ? 'ready' : 'failed',
+    checked_at: new Date().toISOString(),
+    detail: result || null
+  };
+  return true;
+}
+
+function setPrimaryIngress(kind) {
+  if (kind !== 'native' && kind !== 'cloudflare') return false;
+  const candidate = ingressEndpoints[kind];
+  if (!candidate?.host) return false;
+  publicEndpoint = { ...candidate, primary_ingress: kind };
+  atomicJsonWrite(ENDPOINT_FILE, publicEndpoint);
+  process.env.PUBLIC_ENDPOINT = `${candidate.protocol}://${candidate.host}:${candidate.port}`;
+  console.log(`[endpoint:primary] kind=${kind} ${candidate.protocol}://${candidate.host}:${candidate.port}`);
+  return true;
+}
+
+function setPublicEndpoint(endpoint, source = 'runtime') {
+  const host = clean(endpoint?.host).toLowerCase();
+  const kind = ingressKindForHost(host) || (String(endpoint?.mode || '').includes('cloudflare') ? 'cloudflare' : 'native');
+  if (!setIngressEndpoint(kind, endpoint, source)) return false;
+  return setPrimaryIngress(kind);
+}
+
+function getIngressEndpoint(kind) {
+  const ep = ingressEndpoints[kind];
+  return ep?.host ? { ...ep } : null;
+}
+
+function getIngressStatus() {
+  return {
+    native: {
+      endpoint: ingressEndpoints.native?.host ? { ...ingressEndpoints.native } : null,
+      selftest: { ...ingressSelfTests.native }
+    },
+    cloudflare: {
+      endpoint: ingressEndpoints.cloudflare?.host ? { ...ingressEndpoints.cloudflare } : null,
+      selftest: { ...ingressSelfTests.cloudflare }
+    },
+    primary: publicEndpoint?.host ? { ...publicEndpoint } : null
+  };
 }
 
 function formatHost(host) { return net.isIP(host) === 6 ? `[${host}]` : host; }
@@ -275,7 +376,21 @@ function nodeUri(ep) {
   const secure = ep.protocol === 'https';
   const qp = new URLSearchParams({ encryption: 'none', security: secure ? 'tls' : 'none', type: 'ws', host: ep.host, path: identity.wsPath });
   if (secure) { qp.set('sni', ep.host); qp.set('alpn', 'http/1.1'); }
+  // Both ingress URIs intentionally keep the same logical node name and identity.
   return `vless://${identity.uuid}@${formatHost(ep.host)}:${ep.port}?${qp.toString()}#${encodeURIComponent(nodeName())}`;
+}
+
+function getSubscriptionUrl(kind, base64 = true) {
+  const ep = ingressEndpoints[kind];
+  if (!ep?.host) return '';
+  return `${baseUrl(ep)}/${identity.subToken}/${base64 ? 'sub64' : 'sub'}`;
+}
+
+function printSubscriptionUrls(prefix = 'SUB') {
+  const nativeUrl = getSubscriptionUrl('native', true);
+  const cloudflareUrl = getSubscriptionUrl('cloudflare', true);
+  if (nativeUrl) console.log(`${prefix}_NATIVE_URL ${nativeUrl}`);
+  if (cloudflareUrl) console.log(`${prefix}_CF_URL ${cloudflareUrl}`);
 }
 
 function send(res, status, body, type = 'text/plain; charset=utf-8') {
@@ -308,8 +423,10 @@ const requestHandler = (req, res) => {
       provider: PROVIDER,
       node_id: identity.nodeId,
       node_name: nodeName(),
-      endpoint_ready: !!ep,
-      endpoint: ep ? `${ep.protocol}://${ep.host}:${ep.port}` : null,
+      endpoint_ready: !!publicEndpoint?.host,
+      endpoint: publicEndpoint ? `${publicEndpoint.protocol}://${publicEndpoint.host}:${publicEndpoint.port}` : null,
+      request_endpoint: ep ? `${ep.protocol}://${ep.host}:${ep.port}` : null,
+      endpoints: getIngressStatus(),
       geo: { country: countryState.code, verified: countryState.verified, mismatch: countryState.mismatch, egress_ip: countryState.egressIp, checked_at: countryState.checkedAt },
       traffic: { connections, upload_bytes: bytesUp, download_bytes: bytesDown },
       registry_proof_sha256: registryProofSha256,
@@ -330,7 +447,25 @@ const requestHandler = (req, res) => {
     const uri = nodeUri(ep);
     if (action === 'sub') return send(res, 200, bodyless ? '' : uri + '\n');
     if (action === 'sub64') return send(res, 200, bodyless ? '' : Buffer.from(uri + '\n').toString('base64'));
-    const payload = { version: 1, provider: PROVIDER, node_id: identity.nodeId, name: nodeName(), endpoint: ep, country: countryState.code, country_verified: countryState.verified, ws_path: identity.wsPath, uri, individual_subscription: baseUrl(ep) + '/' + identity.subToken + '/sub', individual_subscription_base64: baseUrl(ep) + '/' + identity.subToken + '/sub64' };
+    const payload = {
+      version: 2,
+      provider: PROVIDER,
+      node_id: identity.nodeId,
+      name: nodeName(),
+      logical_nodes: 1,
+      endpoint: ep,
+      endpoints: getIngressStatus(),
+      country: countryState.code,
+      country_verified: countryState.verified,
+      ws_path: identity.wsPath,
+      uri,
+      individual_subscription: baseUrl(ep) + '/' + identity.subToken + '/sub',
+      individual_subscription_base64: baseUrl(ep) + '/' + identity.subToken + '/sub64',
+      subscriptions: {
+        native: getSubscriptionUrl('native', true) || null,
+        cloudflare: getSubscriptionUrl('cloudflare', true) || null
+      }
+    };
     return send(res, 200, bodyless ? '' : JSON.stringify(payload, null, 2), 'application/json; charset=utf-8');
   }
 
@@ -570,7 +705,9 @@ server.listen(PORT, HOST, () => {
   console.log(`[ready] infrlo-node v${VERSION} ${HOST}:${PORT} http/ws`);
   console.log(`[ready] provider=${PROVIDER} node_id=${identity.nodeId}`);
   console.log(`[registry] mode=${REGISTRY_TOKEN ? 'bearer-token' : 'public-proof'} url=${REGISTRY_URL}`);
-  console.log('[security] credentials, UUID, WS path, subscription token and VLESS URI are not printed');
+  console.log('[security] registry credentials, UUID, WS path and VLESS URI are not printed; individual subscription URLs are printed by request');
+  console.log(`[ready] logical_nodes=1 configured_ingresses=${[ingressEndpoints.native, ingressEndpoints.cloudflare].filter(x => x?.host).length}`);
+  printSubscriptionUrls('SUB');
   if (REGISTRY_REQUIRE_PUBLIC_SELFTEST) console.log('[registry] REGISTRY_WAITING_PUBLIC_SELFTEST');
   if (publicEndpoint?.host) scheduleRegistration(1000);
   else console.log('[ready] waiting for a proven public endpoint');
@@ -579,4 +716,16 @@ server.listen(PORT, HOST, () => {
 });
 
 
-module.exports = { identity, server, setPublicEndpoint, activateRegistryAfterSelfTest };
+module.exports = {
+  identity,
+  server,
+  setPublicEndpoint,
+  setIngressEndpoint,
+  setIngressSelfTest,
+  setPrimaryIngress,
+  getIngressEndpoint,
+  getIngressStatus,
+  getSubscriptionUrl,
+  printSubscriptionUrls,
+  activateRegistryAfterSelfTest
+};
