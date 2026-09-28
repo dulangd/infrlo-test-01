@@ -26,7 +26,6 @@ const TUNNEL_MODE = /^(1|true|yes|on)$/i.test(String(process.env.INFRLO_CF_QUICK
 const ENDPOINT_OVERRIDE = clean(process.env.PUBLIC_ENDPOINT);
 const INFRLO_NATIVE_HOST = clean(process.env.INFRLO_NATIVE_HOST || 'qqnioc.infrlo.com').toLowerCase();
 const CF_PUBLIC_HOST = clean(process.env.CF_TUNNEL_HOSTNAME).toLowerCase();
-const PRIMARY_INGRESS = clean(process.env.INFRLO_PRIMARY_INGRESS || 'cloudflare').toLowerCase() === 'native' ? 'native' : 'cloudflare';
 
 function clean(v) { return String(v || '').trim(); }
 function validPort(v) {
