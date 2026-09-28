@@ -424,6 +424,8 @@ const requestHandler = (req, res) => {
       provider: PROVIDER,
       node_id: identity.nodeId,
       node_name: nodeName(),
+      logical_nodes: 1,
+      configured_ingresses: [ingressEndpoints.native, ingressEndpoints.cloudflare].filter(x => x?.host).length,
       endpoint_ready: !!publicEndpoint?.host,
       endpoint: publicEndpoint ? `${publicEndpoint.protocol}://${publicEndpoint.host}:${publicEndpoint.port}` : null,
       request_endpoint: ep ? `${ep.protocol}://${ep.host}:${ep.port}` : null,
