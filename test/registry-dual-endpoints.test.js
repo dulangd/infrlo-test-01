@@ -16,4 +16,6 @@ test('dual Registry implementation keeps legacy CF id and adds Native id', () =>
   assert.match(source, /heartbeatEndpoint\(kind\)/);
   assert.match(source, /REGISTRY_CF_IDENTITY_REPAIRED/);
   assert.match(source, /registerEndpoint\('cloudflare', \{ allowConfigured: true \}\)/);
+  assert.match(source, /registryPayloadFromTarget\(target\)/);
+  assert.doesNotMatch(source, /requestJson\(REGISTRY_URL \+ '\/api\/v1\/register', 'POST', registryPayload\(kind\), REGISTRY_TOKEN\)/);
 });

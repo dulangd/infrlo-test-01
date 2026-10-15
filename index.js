@@ -8,7 +8,7 @@ const https = require('https');
 const net = require('net');
 const crypto = require('crypto');
 
-const VERSION = '1.3.1';
+const VERSION = '1.3.2';
 const PROVIDER = 'infrlo';
 const HOST = '0.0.0.0';
 const PORT = validPort(process.env.PORT) || 8080;
@@ -660,8 +660,7 @@ function registryEndpoint(kind) {
   };
 }
 
-function registryPayload(kind) {
-  const target = registryEndpoint(kind);
+function registryPayloadFromTarget(target) {
   if (!target) return null;
   return {
     kind: 'proxy',
@@ -685,6 +684,10 @@ function registryPayload(kind) {
       runtime: 'nodejs'
     }
   };
+}
+
+function registryPayload(kind) {
+  return registryPayloadFromTarget(registryEndpoint(kind));
 }
 
 function registryKinds() {
@@ -727,7 +730,7 @@ async function registerEndpoint(kind, options = {}) {
   if (!target) return false;
   let r;
   if (REGISTRY_TOKEN) {
-    r = await requestJson(REGISTRY_URL + '/api/v1/register', 'POST', registryPayload(kind), REGISTRY_TOKEN);
+    r = await requestJson(REGISTRY_URL + '/api/v1/register', 'POST', registryPayloadFromTarget(target), REGISTRY_TOKEN);
   } else {
     r = await requestJson(REGISTRY_URL + '/api/v1/register-public', 'POST', {
       provider: PROVIDER,
