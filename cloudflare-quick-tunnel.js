@@ -2,6 +2,9 @@
 
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
+const { Readable } = require('stream');
+const { finished } = require('stream/promises');
 const { spawn } = require('child_process');
 const tls = require('tls');
 
@@ -14,20 +17,144 @@ function assetName(arch = process.arch) {
   return '';
 }
 
-function stateDir() {
-  const home = process.env.HOME || '/tmp';
-  return path.join(home, '.infrlo-node');
+function homeDir() {
+  return process.env.HOME || os.tmpdir() || '/tmp';
 }
 
-function binaryPath() {
-  return path.join(stateDir(), 'bin', 'cloudflared');
+function stateDir() {
+  return path.join(homeDir(), '.infrlo-node');
 }
 
 function caBundlePath() {
   return path.join(stateDir(), 'ca-bundle.pem');
 }
 
+function executable(file) {
+  if (!file) return false;
+  try {
+    fs.accessSync(file, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function pathCandidates() {
+  const out = [];
+  const add = value => {
+    const file = String(value || '').trim();
+    if (file && !out.includes(file)) out.push(file);
+  };
+
+  add(process.env.CLOUDFLARED_BIN);
+  for (const dir of String(process.env.PATH || '').split(path.delimiter)) {
+    if (dir) add(path.join(dir, 'cloudflared'));
+  }
+  add('/usr/local/bin/cloudflared');
+  add('/usr/bin/cloudflared');
+  add('/bin/cloudflared');
+  add(path.join(stateDir(), 'bin', 'cloudflared'));
+  add(path.join(os.tmpdir() || '/tmp', 'infrlo-cloudflared', 'cloudflared'));
+  return out;
+}
+
+function existingBinary() {
+  for (const file of pathCandidates()) {
+    if (executable(file)) {
+      console.log(`CF_TUNNEL_BINARY_REUSE path=${file}`);
+      return file;
+    }
+  }
+  return '';
+}
+
+function nearestExistingDir(input) {
+  let dir = path.resolve(input);
+  while (dir !== path.dirname(dir)) {
+    try {
+      if (fs.statSync(dir).isDirectory()) return dir;
+    } catch {}
+    dir = path.dirname(dir);
+  }
+  return dir;
+}
+
+function freeBytes(input) {
+  try {
+    const stat = fs.statfsSync(nearestExistingDir(input));
+    return Number(stat.bavail) * Number(stat.bsize);
+  } catch {
+    return -1;
+  }
+}
+
+function formatMiB(bytes) {
+  return bytes < 0 ? 'unknown' : (bytes / 1024 / 1024).toFixed(1);
+}
+
+function removeSafe(file) {
+  try {
+    fs.rmSync(file, { recursive: true, force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function cleanupRuntimeCaches() {
+  const home = homeDir();
+  const targets = [
+    path.join(home, '.npm', '_cacache'),
+    path.join(home, '.npm', '_logs'),
+    path.join(home, '.cache', 'node-gyp'),
+    path.join(os.tmpdir() || '/tmp', 'infrlo-cloudflared')
+  ];
+
+  let removed = 0;
+  for (const target of targets) {
+    try {
+      if (!fs.existsSync(target)) continue;
+      if (removeSafe(target)) removed += 1;
+    } catch {}
+  }
+
+  const binDir = path.join(stateDir(), 'bin');
+  try {
+    for (const name of fs.readdirSync(binDir)) {
+      if (/^cloudflared\..+\.tmp$/.test(name) && removeSafe(path.join(binDir, name))) removed += 1;
+    }
+  } catch {}
+
+  console.log(`CF_STORAGE_CLEANUP targets_removed=${removed}`);
+}
+
+function downloadDirs() {
+  const dirs = [
+    path.join(stateDir(), 'bin'),
+    path.join(os.tmpdir() || '/tmp', 'infrlo-cloudflared')
+  ];
+  return [...new Set(dirs)].sort((a, b) => freeBytes(b) - freeBytes(a));
+}
+
+function systemCaBundle() {
+  const candidates = [
+    '/etc/ssl/certs/ca-certificates.crt',
+    '/etc/pki/tls/certs/ca-bundle.crt',
+    '/etc/ssl/cert.pem'
+  ];
+  for (const file of candidates) {
+    try {
+      fs.accessSync(file, fs.constants.R_OK);
+      return file;
+    } catch {}
+  }
+  return '';
+}
+
 function ensureCaBundle() {
+  const system = systemCaBundle();
+  if (system) return system;
+
   const file = caBundlePath();
   const roots = Array.isArray(tls.rootCertificates) ? tls.rootCertificates.filter(Boolean) : [];
   if (!roots.length) throw new Error('node_root_ca_empty');
@@ -77,41 +204,76 @@ function parseRegistered(text) {
   return { protocol, location };
 }
 
-async function ensureBinary() {
-  const file = binaryPath();
-  try {
-    fs.accessSync(file, fs.constants.X_OK);
-    return file;
-  } catch {}
-
-  const asset = assetName();
-  if (!asset) throw new Error(`unsupported_arch_${process.arch}`);
-
-  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+async function downloadBinaryTo(dir, asset) {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const file = path.join(dir, 'cloudflared');
   const tmp = `${file}.${process.pid}.tmp`;
   const url = `https://github.com/cloudflare/cloudflared/releases/latest/download/${asset}`;
-
-  console.log(`CF_TUNNEL_DOWNLOAD_START arch=${process.arch}`);
   const ctl = new AbortController();
-  const timer = setTimeout(() => ctl.abort(), 45000);
+  const timer = setTimeout(() => ctl.abort(), 60000);
+
+  console.log(`CF_TUNNEL_DOWNLOAD_START arch=${process.arch} dir=${dir} free_mib=${formatMiB(freeBytes(dir))}`);
   try {
     const res = await fetch(url, {
       redirect: 'follow',
-      headers: { 'user-agent': 'infrlo-node/1.2.0' },
+      headers: { 'user-agent': 'infrlo-node/1.3.3' },
       signal: ctl.signal
     });
     if (!res.ok) throw new Error(`download_http_${res.status}`);
-    const buf = Buffer.from(await res.arrayBuffer());
-    if (buf.length < 5 * 1024 * 1024) throw new Error(`download_too_small_${buf.length}`);
-    fs.writeFileSync(tmp, buf, { mode: 0o700 });
+    if (!res.body) throw new Error('download_empty_body');
+
+    const output = fs.createWriteStream(tmp, { mode: 0o700, flags: 'w' });
+    await finished(Readable.fromWeb(res.body).pipe(output));
+
+    const size = fs.statSync(tmp).size;
+    if (size < 5 * 1024 * 1024) throw new Error(`download_too_small_${size}`);
     fs.renameSync(tmp, file);
     fs.chmodSync(file, 0o700);
-    console.log(`CF_TUNNEL_DOWNLOAD_READY bytes=${buf.length}`);
+    console.log(`CF_TUNNEL_DOWNLOAD_READY bytes=${size} path=${file}`);
     return file;
   } finally {
     clearTimeout(timer);
     try { fs.unlinkSync(tmp); } catch {}
   }
+}
+
+async function ensureBinary() {
+  const reused = existingBinary();
+  if (reused) return reused;
+
+  const asset = assetName();
+  if (!asset) throw new Error(`unsupported_arch_${process.arch}`);
+
+  let dirs = downloadDirs();
+  console.log('CF_STORAGE_DIAG ' + dirs.map(dir => `${dir}=${formatMiB(freeBytes(dir))}MiB`).join(' '));
+
+  const minimumFree = 64 * 1024 * 1024;
+  if (dirs.every(dir => {
+    const free = freeBytes(dir);
+    return free >= 0 && free < minimumFree;
+  })) {
+    cleanupRuntimeCaches();
+    dirs = downloadDirs();
+    console.log('CF_STORAGE_AFTER_CLEANUP ' + dirs.map(dir => `${dir}=${formatMiB(freeBytes(dir))}MiB`).join(' '));
+  }
+
+  const errors = [];
+  for (const dir of dirs) {
+    try {
+      return await downloadBinaryTo(dir, asset);
+    } catch (e) {
+      const code = String(e?.code || '');
+      errors.push(`${dir}:${code || e.message}`);
+      if (code === 'ENOSPC' || /no space left on device|ENOSPC/i.test(String(e?.message || e))) {
+        cleanupRuntimeCaches();
+        console.warn(`CF_TUNNEL_STORAGE_RETRY dir=${dir} free_mib=${formatMiB(freeBytes(dir))}`);
+        continue;
+      }
+      throw e;
+    }
+  }
+
+  throw new Error('cloudflared_storage_exhausted_' + errors.join('|'));
 }
 
 function waitForReady(proc, timeoutMs = 30000) {
