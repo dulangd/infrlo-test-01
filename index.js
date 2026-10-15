@@ -8,7 +8,7 @@ const https = require('https');
 const net = require('net');
 const crypto = require('crypto');
 
-const VERSION = '1.3.0';
+const VERSION = '1.3.1';
 const PROVIDER = 'infrlo';
 const HOST = '0.0.0.0';
 const PORT = validPort(process.env.PORT) || 8080;
@@ -708,8 +708,22 @@ function scheduleRegistration(delay = 0) {
   }), delay);
 }
 
-async function registerEndpoint(kind) {
-  const target = registryEndpoint(kind);
+async function registerEndpoint(kind, options = {}) {
+  const allowConfigured = !!options.allowConfigured;
+  const target = allowConfigured && kind === 'cloudflare'
+    ? (() => {
+        const ep = ingressEndpoints.cloudflare;
+        if (!ep?.host) return null;
+        return {
+          kind: 'cloudflare',
+          ep,
+          nodeId: registryNodeId('cloudflare'),
+          name: registryNodeName('cloudflare'),
+          uri: nodeUri(ep, 'CF'),
+          subscriptionUrl: getSubscriptionUrl('cloudflare', false)
+        };
+      })()
+    : registryEndpoint(kind);
   if (!target) return false;
   let r;
   if (REGISTRY_TOKEN) {
@@ -810,6 +824,23 @@ async function activateRegistryAfterSelfTest() {
     registryWaitLogged = false;
     registryLastError = '';
   }
+
+  // Migration repair: older single-record builds could overwrite infrlo-01
+  // with the Native URI when CF self-test failed and Native became the fallback
+  // primary. The base ID permanently belongs to the configured CF endpoint.
+  // Repair that identity even if the full CF relay self-test is currently
+  // degraded; heartbeat still remains gated by the actual CF self-test.
+  if (ingressEndpoints.cloudflare?.host && !registryKindReady('cloudflare')) {
+    try {
+      const repaired = await registerEndpoint('cloudflare', { allowConfigured: true });
+      if (repaired) {
+        console.log(`[registry] REGISTRY_CF_IDENTITY_REPAIRED node_id=${identity.nodeId} host=${ingressEndpoints.cloudflare.host} selftest=not-ready`);
+      }
+    } catch (e) {
+      console.warn('[registry] CF identity repair failed:', e.message);
+    }
+  }
+
   const ok = await registerNode();
   if (!ok) return false;
 
