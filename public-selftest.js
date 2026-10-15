@@ -192,7 +192,7 @@ function publicAttempt(host, port, identity, connectHost = '') {
 async function resolveIpv4ViaDoh(host) {
   const url = `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(host)}&type=A`;
   const res = await fetch(url, {
-    headers: { accept: 'application/dns-json', 'user-agent': 'infrlo-node/1.2.0' },
+    headers: { accept: 'application/dns-json', 'user-agent': 'infrlo-node/1.3.0' },
     signal: AbortSignal.timeout(5000)
   });
   if (!res.ok) throw new Error(`doh_http_${res.status}`);
@@ -375,15 +375,15 @@ async function run() {
   const readyCount = Number(nativeReady) + Number(cloudflareReady);
 
   if (readyCount === 2) {
-    console.log(`DUAL_INGRESS_READY logical_nodes=1 node_id=${identity.nodeId} native=${nativeHost}:443 cloudflare=${cloudflareHost}:443`);
+    console.log(`DUAL_INGRESS_READY logical_nodes=1 registry_nodes=2 node_id=${identity.nodeId} native=${nativeHost}:443 cloudflare=${cloudflareHost}:443`);
   } else if (readyCount === 1) {
-    console.log(`DUAL_INGRESS_DEGRADED logical_nodes=1 node_id=${identity.nodeId} native=${nativeReady ? 'ready' : 'failed'} cloudflare=${cloudflareReady ? 'ready' : 'failed'}`);
+    console.log(`DUAL_INGRESS_DEGRADED logical_nodes=1 registry_nodes=1 node_id=${identity.nodeId} native=${nativeReady ? 'ready' : 'failed'} cloudflare=${cloudflareReady ? 'ready' : 'failed'}`);
   } else {
     console.log(`DUAL_INGRESS_FAILED logical_nodes=1 node_id=${identity.nodeId}`);
   }
 
-  // Registry remains exactly one logical node. Prefer the configured primary
-  // ingress (Cloudflare by default), then fall back to the other healthy path.
+  // Primary ingress remains the compatibility/default subscription path.
+  // Registry activation below now registers each healthy ingress independently.
   const configuredPrimary = String(process.env.INFRLO_PRIMARY_INGRESS || 'cloudflare').trim().toLowerCase() === 'native'
     ? 'native'
     : 'cloudflare';

@@ -8,7 +8,7 @@ const https = require('https');
 const net = require('net');
 const crypto = require('crypto');
 
-const VERSION = '1.2.0';
+const VERSION = '1.3.0';
 const PROVIDER = 'infrlo';
 const HOST = '0.0.0.0';
 const PORT = validPort(process.env.PORT) || 8080;
@@ -372,13 +372,13 @@ function baseUrl(ep) {
   const defaultPort = (ep.protocol === 'https' && ep.port === 443) || (ep.protocol === 'http' && ep.port === 80);
   return `${ep.protocol}://${formatHost(ep.host)}${defaultPort ? '' : ':' + ep.port}`;
 }
-function nodeUri(ep) {
+function nodeUri(ep, suffix = '') {
   if (!ep) return null;
   const secure = ep.protocol === 'https';
   const qp = new URLSearchParams({ encryption: 'none', security: secure ? 'tls' : 'none', type: 'ws', host: ep.host, path: identity.wsPath });
   if (secure) { qp.set('sni', ep.host); qp.set('alpn', 'http/1.1'); }
-  // Both ingress URIs intentionally keep the same logical node name and identity.
-  return `vless://${identity.uuid}@${formatHost(ep.host)}:${ep.port}?${qp.toString()}#${encodeURIComponent(nodeName())}`;
+  const label = suffix ? `${nodeName()}-${suffix}` : nodeName();
+  return `vless://${identity.uuid}@${formatHost(ep.host)}:${ep.port}?${qp.toString()}#${encodeURIComponent(label)}`;
 }
 
 function getSubscriptionUrl(kind, base64 = true) {
@@ -425,6 +425,7 @@ const requestHandler = (req, res) => {
       node_id: identity.nodeId,
       node_name: nodeName(),
       logical_nodes: 1,
+      registry_nodes: registryKinds().length,
       configured_ingresses: [ingressEndpoints.native, ingressEndpoints.cloudflare].filter(x => x?.host).length,
       endpoint_ready: !!publicEndpoint?.host,
       endpoint: publicEndpoint ? `${publicEndpoint.protocol}://${publicEndpoint.host}:${publicEndpoint.port}` : null,
@@ -628,6 +629,68 @@ function requestJson(urlString, method, body, token = '', timeout = 10_000) {
     req.end(data);
   });
 }
+function registryKindReady(kind) {
+  const ep = ingressEndpoints[kind];
+  if (!ep?.host) return false;
+  if (!REGISTRY_REQUIRE_PUBLIC_SELFTEST) return true;
+  return ingressSelfTests[kind]?.status === 'ready';
+}
+
+function registryNodeId(kind) {
+  // infrlo-01 historically represented the Cloudflare-primary registration.
+  // Preserve that stable Railway record and add Native as a second identity.
+  return kind === 'cloudflare' ? identity.nodeId : `${identity.nodeId}-native`;
+}
+
+function registryNodeName(kind) {
+  return `${nodeName()}-${kind === 'cloudflare' ? 'CF' : 'Native'}`;
+}
+
+function registryEndpoint(kind) {
+  if (kind !== 'native' && kind !== 'cloudflare') return null;
+  if (!registryKindReady(kind)) return null;
+  const ep = ingressEndpoints[kind];
+  return {
+    kind,
+    ep,
+    nodeId: registryNodeId(kind),
+    name: registryNodeName(kind),
+    uri: nodeUri(ep, kind === 'cloudflare' ? 'CF' : 'Native'),
+    subscriptionUrl: getSubscriptionUrl(kind, false)
+  };
+}
+
+function registryPayload(kind) {
+  const target = registryEndpoint(kind);
+  if (!target) return null;
+  return {
+    kind: 'proxy',
+    node_id: target.nodeId,
+    name: target.name,
+    provider: PROVIDER,
+    protocol: 'vless',
+    uri: target.uri,
+    subscription_url: target.subscriptionUrl,
+    address: target.ep.host,
+    port: target.ep.port,
+    transport: 'ws',
+    tls: target.ep.protocol === 'https',
+    priority: 80,
+    region: countryState.code || 'XX',
+    meta: {
+      platform: 'Infrlo',
+      endpoint: target.kind,
+      ingress: target.ep.mode || target.ep.source || target.kind,
+      ws_path: identity.wsPath,
+      runtime: 'nodejs'
+    }
+  };
+}
+
+function registryKinds() {
+  return ['cloudflare', 'native'].filter(registryKindReady);
+}
+
 function scheduleRegistration(delay = 0) {
   if (!registryActivated) {
     registryLastError = 'waiting for public self-test';
@@ -637,54 +700,107 @@ function scheduleRegistration(delay = 0) {
     }
     return;
   }
-  if (!publicEndpoint?.host) { registryLastError = 'public endpoint not ready'; return; }
+  if (!registryKinds().length) { registryLastError = 'public endpoints not ready'; return; }
   clearTimeout(registerTimer);
   registerTimer = setTimeout(() => registerNode().catch(e => {
     registryLastError = e.message;
     console.warn('[registry] register failed:', e.message);
   }), delay);
 }
+
+async function registerEndpoint(kind) {
+  const target = registryEndpoint(kind);
+  if (!target) return false;
+  let r;
+  if (REGISTRY_TOKEN) {
+    r = await requestJson(REGISTRY_URL + '/api/v1/register', 'POST', registryPayload(kind), REGISTRY_TOKEN);
+  } else {
+    r = await requestJson(REGISTRY_URL + '/api/v1/register-public', 'POST', {
+      provider: PROVIDER,
+      node_id: target.nodeId,
+      name: target.name,
+      uri: target.uri,
+      priority: 80,
+      endpoint: baseUrl(target.ep),
+      proof: registryProof
+    });
+  }
+  registryLastStatus = r.status;
+  if (r.status < 200 || r.status >= 300) {
+    const message = 'HTTP ' + r.status + (r.body ? ': ' + String(r.body).slice(0, 240) : '');
+    console.warn(`[registry] register failed endpoint=${kind} node_id=${target.nodeId} ${message}`);
+    throw new Error(message);
+  }
+  console.log(`[registry] registered endpoint=${kind} node_id=${target.nodeId} name=${target.name} mode=${REGISTRY_TOKEN ? 'bearer-token' : 'public-proof'}`);
+  return true;
+}
+
 async function registerNode() {
   if (!registryActivated) return false;
-  if (!publicEndpoint?.host) return false;
+  const kinds = registryKinds();
+  if (!kinds.length) return false;
   await verifyCountry();
   registryLastAttemptAt = new Date().toISOString();
   registryLastError = '';
-  const uri = nodeUri(publicEndpoint);
-  let r;
-  if (REGISTRY_TOKEN) {
-    r = await requestJson(REGISTRY_URL + '/api/v1/register', 'POST', { kind: 'proxy', node_id: identity.nodeId, name: nodeName(), provider: PROVIDER, uri, priority: 80 }, REGISTRY_TOKEN);
-  } else {
-    r = await requestJson(REGISTRY_URL + '/api/v1/register-public', 'POST', { provider: PROVIDER, node_id: identity.nodeId, name: nodeName(), uri, priority: 80, endpoint: baseUrl(publicEndpoint), proof: registryProof });
+
+  let okCount = 0;
+  const errors = [];
+  for (const kind of kinds) {
+    try {
+      if (await registerEndpoint(kind)) okCount += 1;
+    } catch (e) {
+      errors.push(`${kind}:${e.message}`);
+    }
   }
-  registryLastStatus = r.status;
-  registered = r.status >= 200 && r.status < 300;
+
+  registered = okCount === kinds.length;
   if (!registered) {
-    registryLastError = 'HTTP ' + r.status + (r.body ? ': ' + String(r.body).slice(0, 240) : '');
-    throw new Error(registryLastError);
+    registryLastError = errors.join('; ') || `registered ${okCount}/${kinds.length}`;
+    if (!okCount) throw new Error(registryLastError);
+  } else {
+    registryLastSuccessAt = new Date().toISOString();
   }
-  registryLastSuccessAt = new Date().toISOString();
-  console.log(`[registry] registered node_id=${identity.nodeId} name=${nodeName()} mode=${REGISTRY_TOKEN ? 'bearer-token' : 'public-proof'}`);
+  console.log(`[registry] REGISTRY_READY endpoints=${okCount}/${kinds.length}`);
+  return okCount > 0;
+}
+
+async function heartbeatEndpoint(kind) {
+  const target = registryEndpoint(kind);
+  if (!target) return false;
+
+  if (!REGISTRY_TOKEN) {
+    return registerEndpoint(kind);
+  }
+
+  const r = await requestJson(REGISTRY_URL + '/api/v1/heartbeat', 'POST', {
+    node_id: target.nodeId,
+    status: 'online',
+    traffic: { connections, upload_bytes: bytesUp, download_bytes: bytesDown }
+  }, REGISTRY_TOKEN);
+
+  registryLastStatus = r.status;
+  if (r.status < 200 || r.status >= 300) throw new Error('HTTP ' + r.status);
   return true;
 }
+
 async function heartbeat() {
-  if (!registryActivated || !publicEndpoint?.host) return;
+  if (!registryActivated) return;
+  const kinds = registryKinds();
+  if (!kinds.length) return;
   if (!countryState.verified) { try { await verifyCountry(true); } catch {} }
-  if (!REGISTRY_TOKEN) {
-    try { await registerNode(); } catch (e) { registered = false; registryLastError = e.message; }
-    return;
+
+  let allOk = true;
+  for (const kind of kinds) {
+    try {
+      await heartbeatEndpoint(kind);
+    } catch (e) {
+      allOk = false;
+      try { await registerEndpoint(kind); }
+      catch (e2) { registryLastError = `${kind}:${e2.message}`; }
+    }
   }
-  try {
-    const r = await requestJson(REGISTRY_URL + '/api/v1/heartbeat', 'POST', { node_id: identity.nodeId, status: 'online', traffic: { connections, upload_bytes: bytesUp, download_bytes: bytesDown } }, REGISTRY_TOKEN);
-    registryLastStatus = r.status;
-    if (r.status < 200 || r.status >= 300) throw new Error('HTTP ' + r.status);
-    registryLastError = '';
-    if (!registered) await registerNode();
-  } catch (e) {
-    registered = false;
-    registryLastError = e.message;
-    try { await registerNode(); } catch (e2) { registryLastError = e2.message; }
-  }
+  registered = allOk;
+  if (allOk) registryLastError = '';
 }
 
 async function activateRegistryAfterSelfTest() {
@@ -709,7 +825,7 @@ server.listen(PORT, HOST, () => {
   console.log(`[ready] provider=${PROVIDER} node_id=${identity.nodeId}`);
   console.log(`[registry] mode=${REGISTRY_TOKEN ? 'bearer-token' : 'public-proof'} url=${REGISTRY_URL}`);
   console.log('[security] registry credentials, UUID, WS path and VLESS URI are not printed; individual subscription URLs are printed by request');
-  console.log(`[ready] logical_nodes=1 configured_ingresses=${[ingressEndpoints.native, ingressEndpoints.cloudflare].filter(x => x?.host).length}`);
+  console.log(`[ready] logical_nodes=1 registry_nodes=${registryKinds().length} configured_ingresses=${[ingressEndpoints.native, ingressEndpoints.cloudflare].filter(x => x?.host).length}`);
   printSubscriptionUrls('SUB');
   if (REGISTRY_REQUIRE_PUBLIC_SELFTEST) console.log('[registry] REGISTRY_WAITING_PUBLIC_SELFTEST');
   if (publicEndpoint?.host) scheduleRegistration(1000);
